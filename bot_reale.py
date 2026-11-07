@@ -1,6 +1,8 @@
 import asyncio
 import os
 import time
+from flask import Flask
+import threading
 from telethon import TelegramClient, events, Button
 from telethon.tl.functions.account import ResetAuthorizationRequest
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneNumberInvalidError, AuthRestartError
@@ -16,6 +18,20 @@ os.makedirs(SESSION_DIR, exist_ok=True)
 
 user_states = {}
 user_data_store = {}
+
+# --- MINI SERVER FLASK PER TENERE APERTA LA PORTA SU RENDER ---
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot Telegram attivo 24/7!"
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+# Avvia il server web in background
+threading.Thread(target=run_web, daemon=True).start()
 
 # Avvio del bot principale con Telethon
 bot = TelegramClient('bot_main_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
@@ -445,10 +461,10 @@ async def message_router(event):
         await event.respond("✅ **Messaggio di benvenuto (DM) impostato con successo!**")
         await show_spam_settings_menu(event, user_id)
 
-# Funzione principale che avvia il bot e il task in background in modo pulito
+# Avvio principale del bot e del task in background
 async def main():
     asyncio.create_task(background_security_checker())
-    print("🤖 Bot avviato correttamente con timer 24h e gestione sicura...")
+    print("🤖 Bot definitivo avviato con Flask e timer 24h...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
